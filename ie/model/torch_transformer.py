@@ -72,6 +72,7 @@ class TorchTransformer:
         self.lm_head = take(source.lm_head)
         self.cos = take(source.cos)
         self.sin = take(source.sin)
+        self.graphs = None
 
     def allocate_caches(self, num_blocks: int, block_size: int):
         pairs = [tb.allocate_kv_cache(num_blocks, block_size, self.config.num_kv_heads,
@@ -79,14 +80,28 @@ class TorchTransformer:
                  for _ in range(self.config.num_layers)]
         return [p[0] for p in pairs], [p[1] for p in pairs]
 
+    @property
+    def uses_flash(self) -> bool:
+        return fb.AVAILABLE and self.dtype in (torch.float16, torch.bfloat16)
+
+    def run(self, tokens, positions, block_tables, plan, layout, k_caches, v_caches,
+            block_size: int):
+        x = self.embedding.index_select(0, tokens)
+        for block, k_cache, v_cache in zip(self.blocks, k_caches, v_caches):
+            x = block.forward(x, layout, k_cache, v_cache, self.cos, self.sin,
+                              block_size, positions, block_tables, plan)
+        return tb.rms_norm(x, self.final_norm, self.config.norm_eps)
+
     def forward(self, layout: BatchLayout, k_caches, v_caches, block_size: int):
-        tokens = torch.as_tensor(layout.token_ids, device=self.device, dtype=torch.long)
-        positions = torch.as_tensor(layout.positions, device=self.device, dtype=torch.long)
-        block_tables = torch.as_tensor(layout.block_tables, device=self.device, dtype=torch.long)
+        if self.graphs is not None and self.graphs.can_replay(layout):
+            return self.graphs.replay(layout, k_caches, v_caches)
 
         as_tensor = lambda values, dtype=torch.long: torch.as_tensor(
             values, device=self.device, dtype=dtype)
-        use_flash = fb.AVAILABLE and self.dtype in (torch.float16, torch.bfloat16)
+        tokens = as_tensor(layout.token_ids)
+        positions = as_tensor(layout.positions)
+        block_tables = as_tensor(layout.block_tables)
+        use_flash = self.uses_flash
         plan = {
             "flash": use_flash,
             "scale": self.config.head_dim ** -0.5,
@@ -98,12 +113,8 @@ class TorchTransformer:
                              if use_flash and layout.max_context_len > layout.max_query_len
                              else None),
         }
-
-        x = self.embedding.index_select(0, tokens)
-        for block, k_cache, v_cache in zip(self.blocks, k_caches, v_caches):
-            x = block.forward(x, layout, k_cache, v_cache, self.cos, self.sin,
-                              block_size, positions, block_tables, plan)
-        return tb.rms_norm(x, self.final_norm, self.config.norm_eps)
+        return self.run(tokens, positions, block_tables, plan, layout,
+                        k_caches, v_caches, block_size)
 
     def logits_for_last_token_of_each(self, hidden, query_lens: list[int]) -> np.ndarray:
         return self.logits_on_device(hidden, query_lens).float().cpu().numpy()

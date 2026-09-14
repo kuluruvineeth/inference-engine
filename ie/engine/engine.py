@@ -22,6 +22,7 @@ class EngineConfig:
     max_batch_tokens: int = 2048
     seed: int = 0
     offload_blocks: int = 0
+    capture_graphs: bool = False
 
 
 class Engine:
@@ -43,6 +44,15 @@ class Engine:
                       for _ in range(model.config.num_layers)]
             self.k_caches = [pair[0] for pair in caches]
             self.v_caches = [pair[1] for pair in caches]
+
+        if self.config.capture_graphs and hasattr(model, "uses_flash"):
+            from ..model.decode_graphs import DecodeGraphs
+
+            max_blocks = (4096 + self.config.block_size - 1) // self.config.block_size
+            graphs = DecodeGraphs(model, self.config.block_size,
+                                  min(self.config.max_batch_sequences, 256), max_blocks)
+            graphs.capture(self.k_caches, self.v_caches)
+            model.graphs = graphs
 
         if self.config.offload_blocks > 0:
             from .copier import LayeredSlotCopier

@@ -485,7 +485,7 @@ flash_image = (
 
 
 @app.function(image=flash_image, gpu="A10G", volumes={"/models": MODEL_CACHE}, timeout=3600)
-def flash_throughput(count: int = 64) -> str:
+def flash_throughput(count: int = 64, graphs: bool = False) -> str:
     import sys
     import time
 
@@ -505,7 +505,8 @@ def flash_throughput(count: int = 64) -> str:
 
     engine = Engine(TorchTransformer(model, "cuda", torch.float16),
                     EngineConfig(block_size=256, num_blocks=2048,
-                                 max_batch_tokens=16384, max_batch_sequences=512))
+                                 max_batch_tokens=16384, max_batch_sequences=128,
+                                 capture_graphs=graphs))
     for prompt, length in zip(prompts, lengths):
         engine.submit(prompt, max_new_tokens=length, temperature=0.0)
 
@@ -514,8 +515,9 @@ def flash_throughput(count: int = 64) -> str:
     elapsed = time.perf_counter() - started
 
     total_out = sum(lengths)
+    label = "ours+flash+graphs" if graphs else "ours+flash       "
     report = (f"flash-attn available: {flash_backend.AVAILABLE}\n"
-              f"ours+flash     {count} seqs  {sum(len(p) for p in prompts)} in / "
+              f"{label} {count} seqs  {sum(len(p) for p in prompts)} in / "
               f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
     print(report)
     return report
@@ -544,6 +546,87 @@ def flash_import_check() -> str:
     listing = subprocess.run([sys.executable, "-m", "pip", "list"],
                             capture_output=True, text=True).stdout
     lines += [line for line in listing.splitlines() if "flash" in line.lower() or "torch" in line.lower()]
+    report = "\n".join(lines)
+    print(report)
+    return report
+
+
+nano_image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("git")
+    .pip_install("numpy>=2.0", "tokenizers>=0.20", "huggingface_hub>=0.25",
+                 "transformers>=4.51.0", "xxhash", "triton>=3.0.0")
+    .pip_install("torch==2.8.0", index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install(FLASH_WHEEL)
+    .pip_install("git+https://github.com/GeeeekExplorer/nano-vllm.git")
+)
+
+
+@app.function(image=nano_image, gpu="A10G", volumes={"/models": MODEL_CACHE}, timeout=3600)
+def nano_throughput(count: int = 64) -> str:
+    import time
+
+    from nanovllm import LLM, SamplingParams
+    from tokenizers import Tokenizer
+
+    directory = f"/models/{BENCH_MODEL}"
+    tokenizer = Tokenizer.from_file(f"{directory}/tokenizer.json")
+
+    class Shim:
+        vocab_size = tokenizer.get_vocab_size()
+
+    prompts, lengths = _workload(Shim(), count)
+    params = [SamplingParams(temperature=0.6, max_tokens=n, ignore_eos=True) for n in lengths]
+
+    engine = LLM(directory, enforce_eager=False, max_model_len=1024)
+
+    started = time.perf_counter()
+    engine.generate(prompts, params, use_tqdm=False)
+    elapsed = time.perf_counter() - started
+
+    total_out = sum(lengths)
+    report = (f"nano-vllm      {count} seqs  {sum(len(p) for p in prompts)} in / "
+              f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
+    print(report)
+    return report
+
+
+@app.function(image=flash_image, gpu="A10G", volumes={"/models": MODEL_CACHE}, timeout=3600)
+def graphs_do_not_change_output() -> str:
+    import sys
+
+    sys.path.insert(0, REPO)
+    import torch
+
+    from ie.engine.engine import Engine, EngineConfig
+    from ie.engine.text import TextEngine
+    from ie.load.huggingface import load_transformer
+    from ie.load.tokenizer import Tokenizer
+    from ie.model.torch_transformer import TorchTransformer
+
+    directory = f"/models/{BENCH_MODEL}"
+    model, _ = load_transformer(directory)
+    tokenizer = Tokenizer.from_directory(directory)
+    prompts = ["The capital of France is", "def fibonacci(n):", "Water boils at",
+               "The three primary colors are"]
+
+    def run(capture):
+        engine = Engine(TorchTransformer(model, "cuda", torch.float16),
+                        EngineConfig(block_size=256, num_blocks=2048,
+                                     max_batch_tokens=8192, max_batch_sequences=64,
+                                     capture_graphs=capture))
+        return [c.text for c in TextEngine(engine, tokenizer).complete(
+            prompts, max_new_tokens=24, temperature=0.0)]
+
+    eager = run(False)
+    graphed = run(True)
+
+    lines = [f"identical: {eager == graphed}"]
+    for prompt, a, b in zip(prompts, eager, graphed):
+        lines.append(f"  {prompt!r}")
+        lines.append(f"    eager   {a!r}")
+        if a != b:
+            lines.append(f"    graphed {b!r}   <-- DIFFERS")
     report = "\n".join(lines)
     print(report)
     return report

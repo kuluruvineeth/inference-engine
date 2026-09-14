@@ -19,7 +19,7 @@ model, _ = load_transformer("Qwen2.5-0.5B-Instruct")
 tokenizer = Tokenizer.from_directory("Qwen2.5-0.5B-Instruct")
 
 engine = Engine(TorchTransformer(model, "cuda", torch.float16),
-                EngineConfig(block_size=256, num_blocks=2048))
+                EngineConfig(block_size=256, num_blocks=2048, capture_graphs=True))
 text = TextEngine(engine, tokenizer)
 
 print(text.complete(["The capital of France is"], max_new_tokens=20)[0].text)
@@ -37,10 +37,8 @@ Qwen2.5-0.5B-Instruct, one A10G, 64 sequences, 13,797 prompt tokens,
 | engine | time | throughput |
 |---|---|---|
 | vLLM 0.10.1.1 | 2.29 s | 3,547 tok/s |
-| this engine | 5.94 s | 1,365 tok/s |
-
-vLLM is 2.6x faster. Remaining gap is CUDA graphs and a tighter scheduler
-loop; attention itself now uses the same FlashAttention paged kernels.
+| **this engine** | **4.18 s** | **1,940 tok/s** |
+| nano-vllm | 4.50 s | 1,803 tok/s |
 
 How it got there:
 
@@ -50,6 +48,9 @@ How it got there:
 | batched decode attention | 219 |
 | sampling on device | 1,120 |
 | FlashAttention paged kernels | 1,365 |
+| CUDA graphs for decode | 1,940 |
+
+Output is byte-identical with graphs on and off.
 
 Latency on a T4, 12-layer model, 16 requests:
 
@@ -76,8 +77,8 @@ Paged KV cache with prefix sharing and CPU offload · continuous batching with
 chunked prefill and preemption · speculative decoding (draft-target, Medusa,
 EAGLE, n-gram) · quantization (int4, int8, fp8) · tensor, expert and pipeline
 parallelism · mixture of experts · disaggregated prefill and decode · sliding
-window attention with sinks · streaming server with metrics, autoscaling and
-cache-aware routing.
+window attention with sinks · CUDA graph capture for decode · streaming server
+with metrics, autoscaling and cache-aware routing.
 
 Every feature has a test proving it does not change the model's output:
 paged == dense, chunked == whole, sharded == unsharded, GPU == CPU,
