@@ -70,6 +70,10 @@ Latency on a T4, 12-layer model, 16 requests:
 Sources and generators in [`diagrams/`](diagrams/). A per-commit narration
 script is in [`video/NARRATION.md`](video/NARRATION.md).
 
+Ten watercolour posters — one per idea, from the block allocator to the
+optimization ladder — live in the inference atlas alongside this repo
+(`gallery.html`).
+
 ## Install
 
 ```bash
