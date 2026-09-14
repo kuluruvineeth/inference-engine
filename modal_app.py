@@ -205,3 +205,118 @@ def gpu_benchmark() -> str:
     report = "\n".join(rows)
     print(report)
     return report
+
+
+@app.function(image=image, gpu="T4", timeout=1800)
+def kernel_fusion() -> str:
+    import time
+
+    import torch
+
+    device = torch.device("cuda")
+    rows, hidden, inner = 4096, 2048, 8192
+    x = torch.randn(rows, hidden, device=device, dtype=torch.float16)
+    gate = torch.randn(hidden, inner, device=device, dtype=torch.float16)
+    up = torch.randn(hidden, inner, device=device, dtype=torch.float16)
+    down = torch.randn(inner, hidden, device=device, dtype=torch.float16)
+
+    def unfused(x):
+        a = x @ gate
+        b = torch.sigmoid(a)
+        c = a * b
+        d = x @ up
+        e = c * d
+        return e @ down
+
+    def fused(x):
+        return (torch.nn.functional.silu(x @ gate) * (x @ up)) @ down
+
+    compiled = torch.compile(fused)
+
+    def measure(fn, label):
+        for _ in range(3):
+            fn(x)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        started = time.perf_counter()
+        for _ in range(20):
+            fn(x)
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - started) / 20
+        peak = torch.cuda.max_memory_allocated() / 2**20
+        return f"{label:<26}{elapsed*1000:>10.2f}{peak:>14.0f}"
+
+    rows_out = [f"swiglu over {rows}x{hidden} -> {inner}",
+                "",
+                f"{'variant':<26}{'ms/call':>10}{'peak MiB':>14}",
+                measure(unfused, "separate ops"),
+                measure(fused, "silu fused"),
+                measure(compiled, "torch.compile")]
+
+    attn_q = torch.randn(1, 16, 2048, 64, device=device, dtype=torch.float16)
+    attn_k = torch.randn(1, 16, 2048, 64, device=device, dtype=torch.float16)
+    attn_v = torch.randn(1, 16, 2048, 64, device=device, dtype=torch.float16)
+
+    def naive_attention():
+        scores = (attn_q @ attn_k.transpose(-1, -2)) / 8.0
+        mask = torch.ones(2048, 2048, device=device, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~mask, float("-inf"))
+        return torch.softmax(scores, dim=-1) @ attn_v
+
+    def flash_attention():
+        return torch.nn.functional.scaled_dot_product_attention(
+            attn_q, attn_k, attn_v, is_causal=True)
+
+    rows_out += ["", "attention over 2048 tokens, 16 heads, dim 64", "",
+                 f"{'variant':<26}{'ms/call':>10}{'peak MiB':>14}",
+                 measure(lambda _: naive_attention(), "materialised scores"),
+                 measure(lambda _: flash_attention(), "fused sdpa")]
+
+    report = "\n".join(rows_out)
+    print(report)
+    return report
+
+
+@app.function(image=image, gpu="T4", timeout=1800)
+def hardware_profile() -> str:
+    import time
+
+    import torch
+
+    device = torch.device("cuda")
+    properties = torch.cuda.get_device_properties(0)
+
+    rows = [f"{properties.name}",
+            f"  streaming multiprocessors {properties.multi_processor_count}",
+            f"  total memory              {properties.total_memory / 2**30:.1f} GiB",
+            f"  compute capability        {properties.major}.{properties.minor}",
+            ""]
+
+    sizes_mb = [1, 4, 16, 64, 256]
+    rows.append(f"{'transfer MiB':>13}{'HtoD GB/s':>12}{'DtoH GB/s':>12}{'DtoD GB/s':>12}")
+    for size_mb in sizes_mb:
+        count = size_mb * 2**20 // 4
+        host = torch.randn(count, pin_memory=True)
+        dev = torch.empty(count, device=device)
+        other = torch.empty(count, device=device)
+
+        def timed(fn):
+            for _ in range(2):
+                fn()
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            for _ in range(5):
+                fn()
+            torch.cuda.synchronize()
+            return size_mb / 2**10 / ((time.perf_counter() - started) / 5)
+
+        h2d = timed(lambda: dev.copy_(host, non_blocking=True))
+        d2h = timed(lambda: host.copy_(dev, non_blocking=True))
+        d2d = timed(lambda: other.copy_(dev))
+        rows.append(f"{size_mb:>13}{h2d:>12.1f}{d2h:>12.1f}{d2d:>12.1f}")
+
+    rows += ["", "device-to-device is the bandwidth the KV cache actually runs at;",
+             "host transfers are what offloading a block costs"]
+    report = "\n".join(rows)
+    print(report)
+    return report
