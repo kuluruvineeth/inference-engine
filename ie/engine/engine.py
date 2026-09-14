@@ -46,18 +46,32 @@ class Engine:
         self.scheduler.add(seq)
         return seq
 
+    def forward(self, batch):
+        layout = build_layout(batch, self.config.block_size)
+        hidden = self.model.forward(layout, self.k_caches, self.v_caches,
+                                    self.config.block_size)
+        return layout, self.model.logits_for_last_token_of_each(hidden, layout.query_lens)
+
     def step(self) -> list[Sequence]:
         batch = self.scheduler.schedule()
         if not batch:
             return []
 
-        layout = build_layout(batch, self.config.block_size)
-        hidden = self.model.forward(layout, self.k_caches, self.v_caches,
-                                    self.config.block_size)
-        logits = self.model.logits_for_last_token_of_each(hidden, layout.query_lens)
+        _, logits = self.forward(batch)
         temperatures = np.array([seq.temperature for seq in batch.sequences], dtype=np.float32)
         token_ids = sample_from_logits(logits, temperatures, self.generator).tolist()
         return self.scheduler.finish_step(batch, token_ids)
+
+    def step_returning_logits(self) -> tuple[list[Sequence], np.ndarray | None]:
+        batch = self.scheduler.schedule()
+        if not batch:
+            return [], None
+
+        _, logits = self.forward(batch)
+        temperatures = np.array([seq.temperature for seq in batch.sequences], dtype=np.float32)
+        token_ids = sample_from_logits(logits, temperatures, self.generator).tolist()
+        self.scheduler.finish_step(batch, token_ids)
+        return batch.sequences, logits
 
     def run(self, max_steps: int = 100_000) -> list[Sequence]:
         completed: list[Sequence] = []

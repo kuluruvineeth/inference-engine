@@ -151,6 +151,13 @@ class BlockManager:
                 raise RuntimeError("no free block; call can_append() first")
             seq.block_table.append(self._claim_free_block().id)
 
+    def reserve(self, seq: Sequence, num_blocks: int) -> bool:
+        while len(seq.block_table) < num_blocks:
+            if self.num_free == 0:
+                return False
+            seq.block_table.append(self._claim_free_block().id)
+        return True
+
     def share_computed_blocks(self, seq: Sequence) -> None:
         parent: str | None = None
         for index in range(seq.num_blocks):
