@@ -96,7 +96,7 @@ class BlockManager:
         reusable: list[int] = []
         parent: str | None = None
 
-        for index in range(seq.num_blocks):
+        for index in range(seq.num_blocks - 1):
             if not seq.block_is_full(index):
                 break
             tokens = seq.block_tokens(index)
@@ -109,15 +109,20 @@ class BlockManager:
 
         return reusable
 
+    def _blocks_taken_from_pool(self, seq: Sequence, reusable: list[int]) -> int:
+        revived = sum(1 for block_id in reusable if self.blocks[block_id].is_free)
+        return revived + seq.num_blocks - len(reusable)
+
     def can_allocate(self, seq: Sequence) -> bool:
-        return self.num_free >= seq.num_blocks - len(self._reusable_prefix(seq))
+        reusable = self._reusable_prefix(seq)
+        return self.num_free >= self._blocks_taken_from_pool(seq, reusable)
 
     def allocate(self, seq: Sequence) -> int:
         if seq.block_table:
             raise RuntimeError(f"sequence {seq.id} already holds blocks")
 
         reusable = self._reusable_prefix(seq)
-        if self.num_free < seq.num_blocks - len(reusable):
+        if self.num_free < self._blocks_taken_from_pool(seq, reusable):
             raise RuntimeError("no capacity; call can_allocate() first")
 
         for block_id in reusable:

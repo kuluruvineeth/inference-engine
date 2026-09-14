@@ -200,6 +200,36 @@ def test_reuse_rate_is_tracked():
         bm.allocate(b)
 
     st = bm.stats()
-    assert st["reused"] == 6
-    assert st["computed"] == 2
-    assert st["reuse_rate"] > 0.7
+    assert st["reused"] == 3
+    assert st["computed"] == 5
+    assert 0 < st["reuse_rate"] < 1
+
+
+def test_last_block_is_never_reused_so_there_is_always_work():
+    bm = BlockManager(num_blocks=16, block_size=BS)
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    a = seq(prompt)
+    bm.allocate(a)
+    a.num_computed = len(a)
+    bm.share_computed_blocks(a)
+
+    b = seq(prompt)
+    bm.allocate(b)
+    assert b.num_uncomputed >= 1
+    assert b.block_table[0] == a.block_table[0]
+    assert b.block_table[-1] != a.block_table[-1]
+
+
+def test_longer_sequence_still_reuses_the_full_shared_prefix():
+    bm = BlockManager(num_blocks=32, block_size=BS)
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    a = seq(prompt)
+    bm.allocate(a)
+    a.num_computed = len(a)
+    bm.share_computed_blocks(a)
+
+    b = seq(prompt + [9, 10, 11, 12])
+    assert bm.allocate(b) == 8
+    assert b.block_table[:2] == a.block_table[:2]
