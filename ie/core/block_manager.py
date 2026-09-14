@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import deque
 
+from .offload import KVTier, SlotCopier
 from .sequence import Sequence
 
 
@@ -40,7 +41,8 @@ class Block:
 
 
 class BlockManager:
-    def __init__(self, num_blocks: int, block_size: int) -> None:
+    def __init__(self, num_blocks: int, block_size: int,
+                 tier: KVTier | None = None, copier: SlotCopier | None = None) -> None:
         if num_blocks <= 0 or block_size <= 0:
             raise ValueError("num_blocks and block_size must be positive")
         self.block_size = block_size
@@ -49,6 +51,13 @@ class BlockManager:
         self.block_id_by_hash: dict[str, int] = {}
         self.blocks_reused = 0
         self.blocks_computed = 0
+        self.blocks_restored = 0
+        self.tier = tier
+        self.copier = copier
+
+    @property
+    def offload_enabled(self) -> bool:
+        return self.tier is not None and self.copier is not None
 
     @property
     def num_free(self) -> int:
@@ -69,6 +78,8 @@ class BlockManager:
 
     def _forget(self, block: Block) -> None:
         if block.is_shareable and self.block_id_by_hash.get(block.hash) == block.id:
+            if self.offload_enabled:
+                self.tier.admit(block.hash, block.token_ids, self.copier.read_block(block.id))
             del self.block_id_by_hash[block.hash]
         block.hash = None
         block.token_ids = []
@@ -92,8 +103,9 @@ class BlockManager:
         if block.is_free:
             self.free_ids.append(block_id)
 
-    def _reusable_prefix(self, seq: Sequence) -> list[int]:
-        reusable: list[int] = []
+    def _prefix_plan(self, seq: Sequence) -> tuple[list[int], list[str]]:
+        resident: list[int] = []
+        offloaded: list[str] = []
         parent: str | None = None
 
         for index in range(seq.num_blocks - 1):
@@ -102,41 +114,65 @@ class BlockManager:
             tokens = seq.block_tokens(index)
             candidate = chain_hash(tokens, parent)
             block_id = self.block_id_by_hash.get(candidate)
-            if block_id is None or not self.blocks[block_id].holds(tokens):
+
+            if block_id is not None and self.blocks[block_id].holds(tokens):
+                if offloaded:
+                    break
+                resident.append(block_id)
+            elif self.offload_enabled and self.tier.holds(candidate, tokens):
+                offloaded.append(candidate)
+            else:
                 break
-            reusable.append(block_id)
             parent = candidate
 
-        return reusable
+        return resident, offloaded
 
-    def _blocks_taken_from_pool(self, seq: Sequence, reusable: list[int]) -> int:
-        revived = sum(1 for block_id in reusable if self.blocks[block_id].is_free)
-        return revived + seq.num_blocks - len(reusable)
+    def _reusable_prefix(self, seq: Sequence) -> list[int]:
+        return self._prefix_plan(seq)[0]
+
+    def _blocks_taken_from_pool(self, seq: Sequence, resident: list[int],
+                                offloaded: list[str]) -> int:
+        revived = sum(1 for block_id in resident if self.blocks[block_id].is_free)
+        fresh = seq.num_blocks - len(resident) - len(offloaded)
+        return revived + len(offloaded) + fresh
 
     def cached_prefix_tokens(self, seq: Sequence) -> int:
-        return len(self._reusable_prefix(seq)) * self.block_size
+        resident, offloaded = self._prefix_plan(seq)
+        return (len(resident) + len(offloaded)) * self.block_size
 
     def can_allocate(self, seq: Sequence) -> bool:
-        reusable = self._reusable_prefix(seq)
-        return self.num_free >= self._blocks_taken_from_pool(seq, reusable)
+        resident, offloaded = self._prefix_plan(seq)
+        return self.num_free >= self._blocks_taken_from_pool(seq, resident, offloaded)
 
     def allocate(self, seq: Sequence) -> int:
         if seq.block_table:
             raise RuntimeError(f"sequence {seq.id} already holds blocks")
 
-        reusable = self._reusable_prefix(seq)
-        if self.num_free < self._blocks_taken_from_pool(seq, reusable):
+        resident, offloaded = self._prefix_plan(seq)
+        if self.num_free < self._blocks_taken_from_pool(seq, resident, offloaded):
             raise RuntimeError("no capacity; call can_allocate() first")
 
-        for block_id in reusable:
+        for block_id in resident:
             self._claim_shared_block(block_id)
             seq.block_table.append(block_id)
-        for _ in range(len(reusable), seq.num_blocks):
+
+        for key in offloaded:
+            entry = self.tier.take(key)
+            block = self._claim_free_block()
+            self.copier.write_block(block.id, entry[1])
+            block.hash = key
+            block.token_ids = list(entry[0])
+            self.block_id_by_hash[key] = block.id
+            seq.block_table.append(block.id)
+            self.blocks_restored += 1
+
+        cached = len(resident) + len(offloaded)
+        for _ in range(cached, seq.num_blocks):
             seq.block_table.append(self._claim_free_block().id)
 
-        self.blocks_reused += len(reusable)
-        self.blocks_computed += seq.num_blocks - len(reusable)
-        seq.num_computed = len(reusable) * self.block_size
+        self.blocks_reused += cached
+        self.blocks_computed += seq.num_blocks - cached
+        seq.num_computed = cached * self.block_size
         return seq.num_computed
 
     def free(self, seq: Sequence) -> None:
@@ -185,4 +221,6 @@ class BlockManager:
             "computed": self.blocks_computed,
             "reuse_rate": round(self.reuse_rate, 4),
             "shareable": len(self.block_id_by_hash),
+            "restored": self.blocks_restored,
+            "tier_held": len(self.tier) if self.tier else 0,
         }

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..core.block_manager import BlockManager
+from ..core.offload import KVTier
 from ..core.layout import build_layout
 from ..core.scheduler import Scheduler
 from ..core.sequence import Sequence
@@ -20,6 +21,7 @@ class EngineConfig:
     max_batch_sequences: int = 64
     max_batch_tokens: int = 2048
     seed: int = 0
+    offload_blocks: int = 0
 
 
 class Engine:
@@ -41,6 +43,14 @@ class Engine:
                       for _ in range(model.config.num_layers)]
             self.k_caches = [pair[0] for pair in caches]
             self.v_caches = [pair[1] for pair in caches]
+
+        if self.config.offload_blocks > 0:
+            from .copier import LayeredSlotCopier
+
+            self.copier = LayeredSlotCopier(self.k_caches, self.v_caches,
+                                            self.config.block_size)
+            self.blocks.tier = KVTier(self.config.offload_blocks)
+            self.blocks.copier = self.copier
 
     def submit(self, prompt_ids: list[int], max_new_tokens: int = 32,
                temperature: float = 1.0, eos_id: int | None = None) -> Sequence:
