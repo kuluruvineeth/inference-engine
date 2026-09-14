@@ -113,6 +113,9 @@ class BlockManager:
         revived = sum(1 for block_id in reusable if self.blocks[block_id].is_free)
         return revived + seq.num_blocks - len(reusable)
 
+    def cached_prefix_tokens(self, seq: Sequence) -> int:
+        return len(self._reusable_prefix(seq)) * self.block_size
+
     def can_allocate(self, seq: Sequence) -> bool:
         reusable = self._reusable_prefix(seq)
         return self.num_free >= self._blocks_taken_from_pool(seq, reusable)

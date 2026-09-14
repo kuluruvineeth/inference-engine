@@ -75,14 +75,15 @@ class Scheduler:
         while self.waiting and len(batch) < self.max_batch_sequences and budget > 0:
             seq = self.waiting[0]
 
-            if not seq.block_table:
-                if not self.blocks.can_allocate(seq):
-                    break
-                self.stats.tokens_reused_from_cache += self.blocks.allocate(seq)
+            if not seq.block_table and not self.blocks.can_allocate(seq):
+                break
 
-            remaining = seq.num_uncomputed
+            remaining = self._uncomputed_after_cache(seq)
             if remaining > budget and batch:
                 break
+
+            if not seq.block_table:
+                self.stats.tokens_reused_from_cache += self.blocks.allocate(seq)
 
             seq.num_scheduled = min(remaining, budget)
             budget -= seq.num_scheduled
@@ -95,6 +96,11 @@ class Scheduler:
             batch.sequences.append(seq)
 
         return batch
+
+    def _uncomputed_after_cache(self, seq: Sequence) -> int:
+        if seq.block_table:
+            return seq.num_uncomputed
+        return len(seq) - self.blocks.cached_prefix_tokens(seq)
 
     def _schedule_decode(self) -> Batch:
         batch = Batch(is_prefill=False)

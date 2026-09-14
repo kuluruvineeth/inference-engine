@@ -211,3 +211,32 @@ def test_finish_step_rejects_a_token_count_mismatch():
     batch = sched.schedule()
     with pytest.raises(ValueError):
         sched.finish_step(batch, [1, 2, 3])
+
+
+def test_a_deferred_sequence_holds_no_blocks_while_it_waits():
+    sched = build(max_batch_tokens=12)
+    first = seq([1, 2, 3, 4, 5, 6, 7, 8])
+    deferred = seq([9] * 8)
+    sched.add(first)
+    sched.add(deferred)
+
+    batch = sched.schedule()
+    assert batch.sequences == [first]
+    assert deferred.block_table == []
+
+
+def test_a_deferred_sequence_still_sees_a_prefix_published_while_it_waited():
+    sched = build(max_batch_tokens=12)
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+    first = seq(prompt, max_new_tokens=1)
+    later = seq(prompt, max_new_tokens=1)
+    sched.add(first)
+    sched.add(later)
+
+    opening = sched.schedule()
+    assert opening.sequences == [first]
+    sched.finish_step(opening, [0])
+
+    warm = sched.schedule()
+    assert later in warm.sequences
+    assert sched.stats.tokens_reused_from_cache > 0
