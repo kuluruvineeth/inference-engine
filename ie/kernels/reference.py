@@ -78,3 +78,21 @@ def paged_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
         start += query_len
 
     return np.concatenate(outputs, axis=0)
+
+
+def tree_attention(q: np.ndarray, context_k: np.ndarray, context_v: np.ndarray,
+                   tree_k: np.ndarray, tree_v: np.ndarray,
+                   visibility: np.ndarray) -> np.ndarray:
+    num_nodes, num_heads, head_dim = q.shape
+    context_len = context_k.shape[0]
+
+    k = repeat_kv_heads(np.concatenate([context_k, tree_k], axis=0), num_heads)
+    v = repeat_kv_heads(np.concatenate([context_v, tree_v], axis=0), num_heads)
+
+    scores = np.einsum("qhd,khd->hqk", q, k) / np.sqrt(head_dim)
+
+    allowed = np.ones((num_nodes, context_len + num_nodes), dtype=bool)
+    allowed[:, context_len:] = visibility
+    scores = np.where(allowed[None, :, :], scores, -np.inf)
+
+    return np.einsum("hqk,khd->qhd", softmax(scores, axis=-1), v)
