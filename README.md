@@ -59,6 +59,17 @@ Latency on a T4, 12-layer model, 16 requests:
 | cold cache | 864 ms | 109 ms |
 | warm prefix cache | 105 ms | 103 ms |
 
+## Diagrams
+
+| figure | shows |
+|---|---|
+| [architecture](https://excalidraw.com/#json=lp9BfVkrApH2PmTmbo3e1,eVc77MO733ReGFsakZRUKw) | components, ownership, and the five steps of `Engine.step()` |
+| [scheduler](https://excalidraw.com/#json=ytUblYmyvo7r8aunprRxH,FFxm93piGsMRop8V_ZFNOQ) | how one `schedule()` call picks prefill or decode |
+| [block lifecycle](https://excalidraw.com/#json=a450vlW-o6wAcL-WEWv7q,7ciH3WH5vao2r0JWFJNoXw) | why a freed block is still a cache entry |
+
+Sources and generators in [`diagrams/`](diagrams/). A per-commit narration
+script is in [`video/NARRATION.md`](video/NARRATION.md).
+
 ## Install
 
 ```bash
