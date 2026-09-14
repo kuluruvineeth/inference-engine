@@ -96,3 +96,38 @@ def tree_attention(q: np.ndarray, context_k: np.ndarray, context_v: np.ndarray,
     scores = np.where(allowed[None, :, :], scores, -np.inf)
 
     return np.einsum("hqk,khd->qhd", softmax(scores, axis=-1), v)
+
+
+def attention_visibility(query_len: int, context_len: int, window: int | None = None,
+                         sinks: int = 0) -> np.ndarray:
+    rows = np.arange(query_len)[:, None] + (context_len - query_len)
+    cols = np.arange(context_len)[None, :]
+
+    visible = cols <= rows
+    if window is not None:
+        visible &= cols > rows - window
+    if sinks:
+        visible |= cols < sinks
+    return visible
+
+
+def windowed_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                       window: int | None = None, sinks: int = 0) -> np.ndarray:
+    query_len, num_heads, head_dim = q.shape
+    k = repeat_kv_heads(k, num_heads)
+    v = repeat_kv_heads(v, num_heads)
+
+    scores = np.einsum("qhd,khd->hqk", q, k) / np.sqrt(head_dim)
+    visible = attention_visibility(query_len, k.shape[0], window, sinks)
+    scores = np.where(visible[None, :, :], scores, -np.inf)
+    return np.einsum("hqk,khd->qhd", softmax(scores, axis=-1), v)
+
+
+def blocks_touched(context_len: int, window: int | None, sinks: int,
+                   block_size: int) -> int:
+    if window is None:
+        return (context_len + block_size - 1) // block_size
+    recent = min(window, context_len)
+    sink_blocks = (sinks + block_size - 1) // block_size if sinks else 0
+    return min((context_len + block_size - 1) // block_size,
+               (recent + block_size - 1) // block_size + sink_blocks)
