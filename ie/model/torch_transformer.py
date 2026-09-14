@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from ..core.layout import BatchLayout
+from ..kernels import flash_backend as fb
 from ..kernels import torch_backend as tb
 from .transformer import ModelConfig, Transformer
 
@@ -26,7 +27,7 @@ class TorchBlock:
         self.down_proj = take(source.down_proj)
 
     def forward(self, x, layout, k_cache, v_cache, cos, sin, block_size, positions,
-                block_tables):
+                block_tables, plan):
         config = self.config
         normed = tb.rms_norm(x, self.attn_norm, config.norm_eps)
 
@@ -37,11 +38,20 @@ class TorchBlock:
         q = tb.apply_rope(q, positions, cos, sin, config.rope_halved)
         k = tb.apply_rope(k, positions, cos, sin, config.rope_halved)
 
-        slots = torch.as_tensor(layout.slot_mapping, device=x.device, dtype=torch.long)
-        tb.write_kv(k, v, k_cache, v_cache, slots)
+        tb.write_kv(k, v, k_cache, v_cache, plan["slots"])
 
-        attended = tb.paged_attention(q, k_cache, v_cache, block_tables,
-                                      layout.context_lens, layout.query_lens, block_size)
+        if plan["flash"]:
+            if layout.is_prefill:
+                attended = fb.prefill(q, k, v, k_cache, v_cache,
+                                      plan["cu_q"], plan["cu_k"],
+                                      layout.max_query_len, layout.max_context_len,
+                                      plan["paged_tables"], block_size, plan["scale"])
+            else:
+                attended = fb.decode(q, k_cache, v_cache, block_tables,
+                                     plan["context_lens"], block_size, plan["scale"])
+        else:
+            attended = tb.paged_attention(q, k_cache, v_cache, block_tables,
+                                          layout.context_lens, layout.query_lens, block_size)
         x = x + attended.reshape(-1, config.num_heads * config.head_dim).to(x.dtype) @ self.o_proj
 
         normed = tb.rms_norm(x, self.mlp_norm, config.norm_eps)
@@ -74,10 +84,25 @@ class TorchTransformer:
         positions = torch.as_tensor(layout.positions, device=self.device, dtype=torch.long)
         block_tables = torch.as_tensor(layout.block_tables, device=self.device, dtype=torch.long)
 
+        as_tensor = lambda values, dtype=torch.long: torch.as_tensor(
+            values, device=self.device, dtype=dtype)
+        use_flash = fb.AVAILABLE and self.dtype in (torch.float16, torch.bfloat16)
+        plan = {
+            "flash": use_flash,
+            "scale": self.config.head_dim ** -0.5,
+            "slots": as_tensor(layout.slot_mapping),
+            "cu_q": as_tensor(layout.cu_seqlens_q, torch.int32) if use_flash else None,
+            "cu_k": as_tensor(layout.cu_seqlens_k, torch.int32) if use_flash else None,
+            "context_lens": as_tensor(layout.context_lens, torch.int32) if use_flash else None,
+            "paged_tables": (block_tables.to(torch.int32)
+                             if use_flash and layout.max_context_len > layout.max_query_len
+                             else None),
+        }
+
         x = self.embedding.index_select(0, tokens)
         for block, k_cache, v_cache in zip(self.blocks, k_caches, v_caches):
             x = block.forward(x, layout, k_cache, v_cache, self.cos, self.sin,
-                              block_size, positions, block_tables)
+                              block_size, positions, block_tables, plan)
         return tb.rms_norm(x, self.final_norm, self.config.norm_eps)
 
     def logits_for_last_token_of_each(self, hidden, query_lens: list[int]) -> np.ndarray:

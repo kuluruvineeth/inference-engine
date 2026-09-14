@@ -468,3 +468,82 @@ def our_throughput(count: int = 64) -> str:
               f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
     print(report)
     return report
+
+
+FLASH_WHEEL = (
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
+    "flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+)
+
+flash_image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    .pip_install("numpy>=2.0", "tokenizers>=0.20", "huggingface_hub>=0.25")
+    .pip_install("torch==2.8.0", index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install(FLASH_WHEEL)
+    .add_local_dir("ie", f"{REPO}/ie")
+)
+
+
+@app.function(image=flash_image, gpu="A10G", volumes={"/models": MODEL_CACHE}, timeout=3600)
+def flash_throughput(count: int = 64) -> str:
+    import sys
+    import time
+
+    sys.path.insert(0, REPO)
+    import torch
+
+    from ie.engine.engine import Engine, EngineConfig
+    from ie.kernels import flash_backend
+    from ie.load.huggingface import load_transformer
+    from ie.load.tokenizer import Tokenizer
+    from ie.model.torch_transformer import TorchTransformer
+
+    directory = f"/models/{BENCH_MODEL}"
+    model, _ = load_transformer(directory)
+    tokenizer = Tokenizer.from_directory(directory)
+    prompts, lengths = _workload(tokenizer, count)
+
+    engine = Engine(TorchTransformer(model, "cuda", torch.float16),
+                    EngineConfig(block_size=256, num_blocks=2048,
+                                 max_batch_tokens=16384, max_batch_sequences=512))
+    for prompt, length in zip(prompts, lengths):
+        engine.submit(prompt, max_new_tokens=length, temperature=0.0)
+
+    started = time.perf_counter()
+    engine.run()
+    elapsed = time.perf_counter() - started
+
+    total_out = sum(lengths)
+    report = (f"flash-attn available: {flash_backend.AVAILABLE}\n"
+              f"ours+flash     {count} seqs  {sum(len(p) for p in prompts)} in / "
+              f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
+    print(report)
+    return report
+
+
+@app.function(image=flash_image, gpu="A10G", timeout=900)
+def flash_import_check() -> str:
+    import subprocess
+    import sys
+
+    lines = []
+    try:
+        import torch
+        lines.append(f"torch {torch.__version__}")
+    except Exception as error:
+        lines.append(f"torch import failed: {error}")
+
+    try:
+        import flash_attn
+        lines.append(f"flash_attn {flash_attn.__version__}")
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        lines.append("both functions imported")
+    except Exception as error:
+        lines.append(f"flash_attn import failed: {type(error).__name__}: {error}")
+
+    listing = subprocess.run([sys.executable, "-m", "pip", "list"],
+                            capture_output=True, text=True).stdout
+    lines += [line for line in listing.splitlines() if "flash" in line.lower() or "torch" in line.lower()]
+    report = "\n".join(lines)
+    print(report)
+    return report
