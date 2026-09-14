@@ -1,25 +1,27 @@
-"""Prefix caching, measured — the claim from the paper, on real numbers."""
 from ie.core.block_manager import BlockManager
 from ie.core.sequence import Sequence
 
-BS = 16
-SYSTEM = list(range(1000, 1128))          # a 128-token system prompt
-bm = BlockManager(num_blocks=512, block_size=BS)
+BLOCK_SIZE = 16
+SYSTEM_PROMPT = list(range(1000, 1128))
+NUM_CHATS = 20
+UNIQUE_TOKENS = 24
 
-live = []
-for i in range(20):                        # 20 chats sharing that prompt
-    s = Sequence(SYSTEM + [2000 + i] * 24, block_size=BS)
-    bm.allocate(s)
-    s.num_computed = len(s)
-    bm.publish(s)
-    live.append(s)
+manager = BlockManager(num_blocks=512, block_size=BLOCK_SIZE)
+chats = []
 
-st = bm.stats()
-naive = sum((len(s) + BS - 1)//BS for s in live)
-actual = bm.num_total - bm.num_free
-print(f"20 chats, each = 128-token shared system prompt + 24 unique tokens\n")
-print(f"  blocks without sharing : {naive}")
-print(f"  blocks actually used   : {actual}")
-print(f"  saved                  : {naive - actual}  ({100*(naive-actual)/naive:.0f}%)")
-print(f"  prefix hit rate        : {st['hit_rate']:.1%}")
-print(f"  pool utilization       : {st['utilization']:.1%}")
+for i in range(NUM_CHATS):
+    chat = Sequence(SYSTEM_PROMPT + [2000 + i] * UNIQUE_TOKENS, block_size=BLOCK_SIZE)
+    manager.allocate(chat)
+    chat.num_computed = len(chat)
+    manager.share_computed_blocks(chat)
+    chats.append(chat)
+
+without_sharing = sum(chat.num_blocks for chat in chats)
+with_sharing = manager.num_total - manager.num_free
+saved = without_sharing - with_sharing
+
+print(f"{NUM_CHATS} chats, each = {len(SYSTEM_PROMPT)}-token shared prompt + {UNIQUE_TOKENS} unique\n")
+print(f"  blocks without sharing : {without_sharing}")
+print(f"  blocks with sharing    : {with_sharing}")
+print(f"  saved                  : {saved}  ({100 * saved / without_sharing:.0f}%)")
+print(f"  block reuse rate       : {manager.reuse_rate:.1%}")
