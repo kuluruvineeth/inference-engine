@@ -31,9 +31,46 @@ def repeat_kv_heads(x: torch.Tensor, num_query_heads: int) -> torch.Tensor:
     return x.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
 
 
+def batched_decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                             block_tables: torch.Tensor, context_lens: torch.Tensor,
+                             block_size: int) -> torch.Tensor:
+    batch, num_heads, head_dim = q.shape
+    device = q.device
+    longest = int(context_lens.max().item())
+    width = (longest + block_size - 1) // block_size
+
+    within = torch.arange(block_size, device=device)
+    slots = (block_tables[:, :width, None] * block_size + within[None, None, :]).reshape(batch, -1)
+    slots = slots[:, :longest]
+
+    positions = torch.arange(longest, device=device)[None, :]
+    live = positions < context_lens[:, None]
+    slots = torch.where(live, slots, torch.zeros_like(slots))
+
+    k = k_cache.index_select(0, slots.reshape(-1)).view(batch, longest, -1, head_dim)
+    v = v_cache.index_select(0, slots.reshape(-1)).view(batch, longest, -1, head_dim)
+
+    repeats = num_heads // k.shape[2]
+    if repeats > 1:
+        k = k.repeat_interleave(repeats, dim=2)
+        v = v.repeat_interleave(repeats, dim=2)
+
+    attended = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=live[:, None, None, :],
+    )
+    return attended.squeeze(2)
+
+
 def paged_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                     block_tables: torch.Tensor, context_lens: list[int],
                     query_lens: list[int], block_size: int) -> torch.Tensor:
+    if len(query_lens) > 1 and all(length == 1 for length in query_lens):
+        lengths = torch.as_tensor(context_lens, device=q.device, dtype=torch.long)
+        return batched_decode_attention(q, k_cache, v_cache, block_tables, lengths, block_size)
+
     num_heads = q.shape[1]
     outputs = []
     start = 0

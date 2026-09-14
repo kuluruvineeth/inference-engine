@@ -81,6 +81,19 @@ class TorchTransformer:
         return tb.rms_norm(x, self.final_norm, self.config.norm_eps)
 
     def logits_for_last_token_of_each(self, hidden, query_lens: list[int]) -> np.ndarray:
+        return self.logits_on_device(hidden, query_lens).float().cpu().numpy()
+
+    def logits_on_device(self, hidden, query_lens: list[int]) -> torch.Tensor:
         ends = torch.as_tensor(np.cumsum(query_lens) - 1, device=self.device, dtype=torch.long)
-        logits = hidden.index_select(0, ends) @ self.lm_head
-        return logits.float().cpu().numpy()
+        return hidden.index_select(0, ends) @ self.lm_head
+
+    def sample(self, hidden, query_lens: list[int], temperatures) -> list[int]:
+        logits = self.logits_on_device(hidden, query_lens).float()
+        temps = torch.as_tensor(temperatures, device=self.device, dtype=torch.float32)
+        greedy = temps <= 0.0
+        safe = torch.where(greedy, torch.ones_like(temps), temps).unsqueeze(1)
+        probs = torch.softmax(logits / safe, dim=-1)
+        race = torch.empty_like(probs).exponential_(1.0).clamp_min(1e-10)
+        sampled = (probs / race).argmax(dim=-1)
+        chosen = torch.where(greedy, logits.argmax(dim=-1), sampled)
+        return chosen.tolist()

@@ -71,9 +71,17 @@ class Engine:
         if not batch:
             return []
 
-        _, logits = self.forward(batch)
         temperatures = np.array([seq.temperature for seq in batch.sequences], dtype=np.float32)
-        token_ids = sample_from_logits(logits, temperatures, self.generator).tolist()
+
+        if hasattr(self.model, "sample"):
+            layout = build_layout(batch, self.config.block_size)
+            hidden = self.model.forward(layout, self.k_caches, self.v_caches,
+                                        self.config.block_size)
+            token_ids = self.model.sample(hidden, layout.query_lens, temperatures)
+        else:
+            _, logits = self.forward(batch)
+            token_ids = sample_from_logits(logits, temperatures, self.generator).tolist()
+
         return self.scheduler.finish_step(batch, token_ids)
 
     def step_returning_logits(self) -> tuple[list[Sequence], np.ndarray | None]:

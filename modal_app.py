@@ -380,3 +380,91 @@ def real_model_generate(repo_id: str = "Qwen/Qwen2.5-0.5B-Instruct") -> str:
     report_text = "\n".join(lines)
     print(report_text)
     return report_text
+
+
+vllm_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("vllm==0.10.1.1", "transformers==4.55.2", "huggingface_hub>=0.25")
+    .add_local_dir("ie", f"{REPO}/ie")
+)
+
+BENCH_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def _workload(tokenizer, count, seed=0):
+    import random
+
+    generator = random.Random(seed)
+    vocab = tokenizer.vocab_size
+    prompts, lengths = [], []
+    for _ in range(count):
+        prompt_len = generator.randint(96, 320)
+        prompts.append([generator.randrange(1000, min(vocab, 60000)) for _ in range(prompt_len)])
+        lengths.append(generator.randint(64, 192))
+    return prompts, lengths
+
+
+@app.function(image=vllm_image, gpu="A10G", volumes={"/models": MODEL_CACHE},
+              timeout=3600)
+def vllm_throughput(count: int = 64) -> str:
+    import time
+
+    from tokenizers import Tokenizer
+    from vllm import LLM, SamplingParams
+
+    directory = f"/models/{BENCH_MODEL}"
+    tokenizer = Tokenizer.from_file(f"{directory}/tokenizer.json")
+
+    class Shim:
+        vocab_size = tokenizer.get_vocab_size()
+
+    prompts, lengths = _workload(Shim(), count)
+    params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True) for n in lengths]
+
+    engine = LLM(model=directory, enforce_eager=False, max_model_len=1024,
+                 gpu_memory_utilization=0.85, disable_log_stats=True)
+
+    started = time.perf_counter()
+    engine.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
+    elapsed = time.perf_counter() - started
+
+    total_out = sum(lengths)
+    report = (f"vllm 0.10.1.1  {count} seqs  {sum(len(p) for p in prompts)} in / "
+              f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
+    print(report)
+    return report
+
+
+@app.function(image=image, gpu="A10G", volumes={"/models": MODEL_CACHE}, timeout=3600)
+def our_throughput(count: int = 64) -> str:
+    import sys
+    import time
+
+    sys.path.insert(0, REPO)
+    import torch
+
+    from ie.engine.engine import Engine, EngineConfig
+    from ie.load.huggingface import load_transformer
+    from ie.load.tokenizer import Tokenizer
+    from ie.model.torch_transformer import TorchTransformer
+
+    directory = f"/models/{BENCH_MODEL}"
+    model, _ = load_transformer(directory)
+    tokenizer = Tokenizer.from_directory(directory)
+    prompts, lengths = _workload(tokenizer, count)
+
+    engine = Engine(TorchTransformer(model, "cuda", torch.float16),
+                    EngineConfig(block_size=16, num_blocks=8192,
+                                 max_batch_tokens=8192, max_batch_sequences=256))
+    for prompt, length in zip(prompts, lengths):
+        engine.submit(prompt, max_new_tokens=length, temperature=0.0)
+
+    started = time.perf_counter()
+    engine.run()
+    elapsed = time.perf_counter() - started
+
+    total_out = sum(lengths)
+    report = (f"ours           {count} seqs  {sum(len(p) for p in prompts)} in / "
+              f"{total_out} out  {elapsed:.2f}s  {total_out/elapsed:.0f} tok/s")
+    print(report)
+    return report
