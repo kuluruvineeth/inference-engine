@@ -32,11 +32,15 @@ class Engine:
                                    max_batch_tokens=self.config.max_batch_tokens)
         self.generator = np.random.default_rng(self.config.seed)
 
-        caches = [allocate_kv_cache(self.config.num_blocks, self.config.block_size,
-                                    model.config.num_kv_heads, model.config.head_dim)
-                  for _ in range(model.config.num_layers)]
-        self.k_caches = [pair[0] for pair in caches]
-        self.v_caches = [pair[1] for pair in caches]
+        if hasattr(model, "allocate_caches"):
+            self.k_caches, self.v_caches = model.allocate_caches(self.config.num_blocks,
+                                                                 self.config.block_size)
+        else:
+            caches = [allocate_kv_cache(self.config.num_blocks, self.config.block_size,
+                                        model.config.num_kv_heads, model.config.head_dim)
+                      for _ in range(model.config.num_layers)]
+            self.k_caches = [pair[0] for pair in caches]
+            self.v_caches = [pair[1] for pair in caches]
 
     def submit(self, prompt_ids: list[int], max_new_tokens: int = 32,
                temperature: float = 1.0, eos_id: int | None = None) -> Sequence:

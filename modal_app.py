@@ -122,3 +122,86 @@ def decode_is_memory_bound(hidden: int = 4096, layers: int = 32) -> str:
     report = "\n".join(rows)
     print(report)
     return report
+
+
+@app.function(image=image, gpu="T4", timeout=1800)
+def torch_matches_numpy() -> str:
+    import sys
+
+    sys.path.insert(0, REPO)
+    import numpy as np
+    import torch
+
+    from ie.engine.engine import Engine, EngineConfig, build_engine
+    from ie.model.torch_transformer import TorchTransformer
+    from ie.model.transformer import ModelConfig, Transformer
+
+    config = ModelConfig(vocab_size=256, hidden_size=128, num_layers=4, num_heads=8,
+                         num_kv_heads=2, head_dim=16, intermediate_size=256)
+    engine_config = EngineConfig(block_size=16, num_blocks=512, max_batch_tokens=1024)
+    prompts = [[3, 1, 4, 1, 5, 9, 2, 6], [7, 7, 7, 7], list(range(20, 44))]
+
+    cpu = build_engine(config, engine_config, model_seed=1)
+    expected = cpu.generate(prompts, max_new_tokens=12, temperature=0.0)
+
+    source = Transformer(config, seed=1)
+    for dtype, tolerance in ((torch.float32, "fp32"), (torch.float16, "fp16")):
+        gpu = Engine(TorchTransformer(source, "cuda", dtype), engine_config)
+        actual = gpu.generate(prompts, max_new_tokens=12, temperature=0.0)
+        agree = sum(a == b for row_a, row_b in zip(expected, actual)
+                    for a, b in zip(row_a, row_b))
+        total = sum(len(row) for row in expected)
+        print(f"{tolerance}: exact rows {sum(a == b for a, b in zip(expected, actual))}"
+              f"/{len(prompts)}  token agreement {agree}/{total}")
+
+    return "done"
+
+
+@app.function(image=image, gpu="T4", timeout=3600)
+def gpu_benchmark() -> str:
+    import sys
+
+    sys.path.insert(0, REPO)
+    import torch
+
+    from ie.bench.harness import distinct_prompts, offline_workload, run_benchmark, shared_prefix_prompts
+    from ie.engine.engine import Engine, EngineConfig
+    from ie.model.torch_transformer import TorchTransformer
+    from ie.model.transformer import ModelConfig, Transformer
+
+    vocab = 4096
+    config = ModelConfig(vocab_size=vocab, hidden_size=1024, num_layers=12, num_heads=16,
+                         num_kv_heads=4, head_dim=64, intermediate_size=2816)
+    source = Transformer(config, seed=1)
+    rows = [f"model: {config.num_layers}L {config.hidden_size}H "
+            f"{config.num_heads}/{config.num_kv_heads} heads, vocab {vocab}",
+            f"{'scenario':<32}{'ttft p50':>10}{'itl p50':>9}{'tok/s':>10}{'reused':>9}"]
+
+    def engine():
+        return Engine(TorchTransformer(source, "cuda", torch.float16),
+                      EngineConfig(block_size=16, num_blocks=4096, max_batch_tokens=4096))
+
+    def show(label, result):
+        s = result.summary()
+        rows.append(f"{label:<32}{s['ttft_p50']:>10.3f}{s['itl_p50']:>9.4f}"
+                    f"{s['output_tok_per_s']:>10.1f}{s['tokens_reused']:>9}")
+
+    distinct = distinct_prompts(16, prompt_len=256, vocab_size=vocab, seed=1)
+    shared = shared_prefix_prompts(16, prefix_len=224, suffix_len=32, vocab_size=vocab, seed=1)
+
+    show("16 distinct prompts", run_benchmark(engine(), offline_workload(distinct, 32)))
+
+    warm = engine()
+    run_benchmark(warm, offline_workload(shared[:1], 32))
+    show("16 shared prefix (warm)", run_benchmark(warm, offline_workload(shared[1:], 32)))
+
+    for batch_cap in (1, 4, 16):
+        eng = Engine(TorchTransformer(source, "cuda", torch.float16),
+                     EngineConfig(block_size=16, num_blocks=4096, max_batch_tokens=4096,
+                                  max_batch_sequences=batch_cap))
+        show(f"max {batch_cap} sequences in flight",
+             run_benchmark(eng, offline_workload(distinct, 32)))
+
+    report = "\n".join(rows)
+    print(report)
+    return report
