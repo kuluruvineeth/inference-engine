@@ -69,13 +69,19 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, cos: torch.Tensor,
-               sin: torch.Tensor) -> torch.Tensor:
+               sin: torch.Tensor, halved: bool = False) -> torch.Tensor:
     c = cos.index_select(0, positions).unsqueeze(1)
     s = sin.index_select(0, positions).unsqueeze(1)
-    even, odd = x[..., 0::2], x[..., 1::2]
     out = torch.empty_like(x)
-    out[..., 0::2] = even * c - odd * s
-    out[..., 1::2] = even * s + odd * c
+    if halved:
+        half = x.shape[-1] // 2
+        left, right = x[..., :half], x[..., half:]
+        out[..., :half] = left * c - right * s
+        out[..., half:] = right * c + left * s
+    else:
+        even, odd = x[..., 0::2], x[..., 1::2]
+        out[..., 0::2] = even * c - odd * s
+        out[..., 1::2] = even * s + odd * c
     return out
 
 

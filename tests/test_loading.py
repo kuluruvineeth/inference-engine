@@ -206,3 +206,26 @@ def test_missing_weights_are_reported_not_silently_ignored(tmp_path):
     _, report = load_transformer(tmp_path)
     assert not report.is_complete
     assert any("layers.2" in name for name in report.missing)
+
+
+def test_hf_checkpoints_use_the_halved_rope_convention():
+    assert config_from_hf(HF_CONFIG).rope_halved is True
+
+
+def test_qkv_biases_are_optional_and_not_reported_missing(tmp_path):
+    synthetic_checkpoint(tmp_path)
+    _, report = load_transformer(tmp_path)
+    assert report.is_complete
+    assert not any("bias" in name for name in report.missing)
+
+
+def test_a_checkpoint_with_biases_loads_them(tmp_path):
+    tensors = synthetic_checkpoint(tmp_path)
+    spec = config_from_hf(HF_CONFIG)
+    bias = np.arange(spec.num_heads * spec.head_dim, dtype=np.float32)
+    tensors[layer_names(0)["q_bias"]] = bias
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    model, report = load_transformer(tmp_path)
+    assert np.allclose(model.blocks[0].q_bias, bias)
+    assert not report.unexpected

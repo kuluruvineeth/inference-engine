@@ -31,8 +31,8 @@ def rope_tables(max_position: int, head_dim: int, base: float = 10000.0
     return np.cos(angles), np.sin(angles)
 
 
-def apply_rope(x: np.ndarray, positions: list[int] | np.ndarray,
-               cos_table: np.ndarray, sin_table: np.ndarray) -> np.ndarray:
+def apply_rope_interleaved(x: np.ndarray, positions: list[int] | np.ndarray,
+                           cos_table: np.ndarray, sin_table: np.ndarray) -> np.ndarray:
     cos = cos_table[positions][:, None, :]
     sin = sin_table[positions][:, None, :]
     even, odd = x[..., 0::2], x[..., 1::2]
@@ -40,6 +40,25 @@ def apply_rope(x: np.ndarray, positions: list[int] | np.ndarray,
     rotated[..., 0::2] = even * cos - odd * sin
     rotated[..., 1::2] = even * sin + odd * cos
     return rotated
+
+
+def apply_rope_halved(x: np.ndarray, positions: list[int] | np.ndarray,
+                      cos_table: np.ndarray, sin_table: np.ndarray) -> np.ndarray:
+    cos = cos_table[positions][:, None, :]
+    sin = sin_table[positions][:, None, :]
+    half = x.shape[-1] // 2
+    left, right = x[..., :half], x[..., half:]
+    rotated = np.empty_like(x)
+    rotated[..., :half] = left * cos - right * sin
+    rotated[..., half:] = right * cos + left * sin
+    return rotated
+
+
+def apply_rope(x: np.ndarray, positions: list[int] | np.ndarray,
+               cos_table: np.ndarray, sin_table: np.ndarray,
+               halved: bool = False) -> np.ndarray:
+    kernel = apply_rope_halved if halved else apply_rope_interleaved
+    return kernel(x, positions, cos_table, sin_table)
 
 
 def sample_from_logits(logits: np.ndarray, temperatures: np.ndarray,

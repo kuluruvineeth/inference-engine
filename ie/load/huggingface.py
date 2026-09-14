@@ -42,6 +42,7 @@ def config_from_hf(raw: dict) -> ModelConfig:
         max_position=raw.get("max_position_embeddings", 4096),
         rope_base=float(raw.get("rope_theta", 10000.0)),
         norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
+        rope_halved=True,
     )
 
 
@@ -60,6 +61,9 @@ def layer_names(index: int) -> dict[str, str]:
         "k_proj": f"{prefix}.self_attn.k_proj.weight",
         "v_proj": f"{prefix}.self_attn.v_proj.weight",
         "o_proj": f"{prefix}.self_attn.o_proj.weight",
+        "q_bias": f"{prefix}.self_attn.q_proj.bias",
+        "k_bias": f"{prefix}.self_attn.k_proj.bias",
+        "v_bias": f"{prefix}.self_attn.v_proj.bias",
         "mlp_norm": f"{prefix}.post_attention_layernorm.weight",
         "gate_proj": f"{prefix}.mlp.gate_proj.weight",
         "up_proj": f"{prefix}.mlp.up_proj.weight",
@@ -68,6 +72,7 @@ def layer_names(index: int) -> dict[str, str]:
 
 
 TRANSPOSED = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+OPTIONAL = {"q_bias", "k_bias", "v_bias"}
 
 
 def open_checkpoint(directory: str | Path):
@@ -87,9 +92,10 @@ def load_transformer(directory: str | Path) -> tuple[Transformer, LoadReport]:
     missing: list[str] = []
     consumed: set[str] = set()
 
-    def take(name: str) -> np.ndarray | None:
+    def take(name: str, optional: bool = False) -> np.ndarray | None:
         if name not in checkpoint:
-            missing.append(name)
+            if not optional:
+                missing.append(name)
             return None
         consumed.add(name)
         return checkpoint.get(name).astype(np.float32)
@@ -102,7 +108,7 @@ def load_transformer(directory: str | Path) -> tuple[Transformer, LoadReport]:
     for index in range(config.num_layers):
         block: TransformerBlock = model.blocks[index]
         for attribute, name in layer_names(index).items():
-            weight = take(name)
+            weight = take(name, optional=attribute in OPTIONAL)
             if weight is None:
                 continue
             setattr(block, attribute, weight.T.copy() if attribute in TRANSPOSED else weight)

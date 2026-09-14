@@ -4,7 +4,7 @@ REPO = "/root/engine"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy>=2.0", "pytest>=8.0", "torch>=2.4")
+    .pip_install("numpy>=2.0", "pytest>=8.0", "torch>=2.4", "tokenizers>=0.20", "huggingface_hub>=0.25")
     .add_local_dir("ie", f"{REPO}/ie")
     .add_local_dir("tests", f"{REPO}/tests")
     .add_local_dir("examples", f"{REPO}/examples")
@@ -320,3 +320,63 @@ def hardware_profile() -> str:
     report = "\n".join(rows)
     print(report)
     return report
+
+
+MODEL_CACHE = modal.Volume.from_name("ie-models", create_if_missing=True)
+
+
+@app.function(image=image, volumes={"/models": MODEL_CACHE}, timeout=3600)
+def fetch_model(repo_id: str = "Qwen/Qwen2.5-0.5B-Instruct") -> str:
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(repo_id=repo_id, local_dir=f"/models/{repo_id}",
+                             allow_patterns=["*.safetensors", "*.json", "*.txt"])
+    MODEL_CACHE.commit()
+    import os
+    files = sorted(os.listdir(path))
+    report = f"{repo_id} -> {path}\n" + "\n".join(f"  {f}" for f in files)
+    print(report)
+    return report
+
+
+@app.function(image=image, gpu="T4", volumes={"/models": MODEL_CACHE}, timeout=3600)
+def real_model_generate(repo_id: str = "Qwen/Qwen2.5-0.5B-Instruct") -> str:
+    import sys
+
+    sys.path.insert(0, REPO)
+    import torch
+
+    from ie.engine.engine import Engine, EngineConfig
+    from ie.engine.text import TextEngine
+    from ie.load.huggingface import load_transformer
+    from ie.load.tokenizer import Tokenizer
+    from ie.model.torch_transformer import TorchTransformer
+
+    directory = f"/models/{repo_id}"
+    model, report = load_transformer(directory)
+    tokenizer = Tokenizer.from_directory(directory)
+
+    lines = [f"loaded {report.architecture}",
+             f"  parameters      {report.parameters/1e6:.1f}M",
+             f"  layers          {report.layers_loaded}",
+             f"  tied embeddings {report.tied_embeddings}",
+             f"  missing         {len(report.missing)}",
+             f"  unexpected      {report.unexpected[:3]}",
+             f"  vocab           {tokenizer.vocab_size}",
+             f"  eos id          {tokenizer.eos_id}",
+             ""]
+
+    engine = Engine(TorchTransformer(model, "cuda", torch.float16),
+                    EngineConfig(block_size=16, num_blocks=2048, max_batch_tokens=2048))
+    text = TextEngine(engine, tokenizer)
+
+    prompts = ["The capital of France is",
+               "def fibonacci(n):",
+               "Water boils at"]
+    for completion in text.complete(prompts, max_new_tokens=24, temperature=0.0):
+        lines.append(f"  {completion.prompt!r}")
+        lines.append(f"    -> {completion.text!r}")
+
+    report_text = "\n".join(lines)
+    print(report_text)
+    return report_text

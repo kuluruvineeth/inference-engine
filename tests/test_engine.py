@@ -178,3 +178,46 @@ def test_model_config_rejects_incompatible_head_counts():
         ModelConfig(num_heads=4, num_kv_heads=3)
     with pytest.raises(ValueError):
         ModelConfig(head_dim=7)
+
+
+def test_the_two_rope_conventions_disagree():
+    from ie.layers.functional import apply_rope_halved, apply_rope_interleaved
+
+    cos, sin = rope_tables(16, 8)
+    x = np.random.default_rng(9).standard_normal((2, 1, 8)).astype(np.float32)
+    interleaved = apply_rope_interleaved(x, [3, 4], cos, sin)
+    halved = apply_rope_halved(x, [3, 4], cos, sin)
+    assert not np.allclose(interleaved, halved, atol=1e-4)
+
+
+def test_both_rope_conventions_preserve_norms():
+    from ie.layers.functional import apply_rope_halved, apply_rope_interleaved
+
+    cos, sin = rope_tables(16, 8)
+    x = np.random.default_rng(10).standard_normal((3, 2, 8)).astype(np.float32)
+    for kernel in (apply_rope_interleaved, apply_rope_halved):
+        rotated = kernel(x, [0, 1, 2], cos, sin)
+        assert np.allclose(np.linalg.norm(x, axis=-1),
+                           np.linalg.norm(rotated, axis=-1), atol=1e-5)
+
+
+def test_both_rope_conventions_are_identity_at_position_zero():
+    from ie.layers.functional import apply_rope_halved, apply_rope_interleaved
+
+    cos, sin = rope_tables(8, 8)
+    x = np.random.default_rng(11).standard_normal((1, 1, 8)).astype(np.float32)
+    for kernel in (apply_rope_interleaved, apply_rope_halved):
+        assert np.allclose(kernel(x, [0], cos, sin), x, atol=1e-6)
+
+
+def test_halved_rope_keeps_relative_position_invariance():
+    from ie.layers.functional import apply_rope_halved
+
+    cos, sin = rope_tables(128, 8)
+    generator = np.random.default_rng(12)
+    q = generator.standard_normal((1, 1, 8)).astype(np.float32)
+    k = generator.standard_normal((1, 1, 8)).astype(np.float32)
+
+    near = np.sum(apply_rope_halved(q, [5], cos, sin) * apply_rope_halved(k, [3], cos, sin))
+    far = np.sum(apply_rope_halved(q, [105], cos, sin) * apply_rope_halved(k, [103], cos, sin))
+    assert np.isclose(near, far, atol=1e-4)

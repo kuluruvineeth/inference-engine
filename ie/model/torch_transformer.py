@@ -17,6 +17,9 @@ class TorchBlock:
         self.k_proj = take(source.k_proj)
         self.v_proj = take(source.v_proj)
         self.o_proj = take(source.o_proj)
+        self.q_bias = take(source.q_bias)
+        self.k_bias = take(source.k_bias)
+        self.v_bias = take(source.v_bias)
         self.mlp_norm = take(source.mlp_norm)
         self.gate_proj = take(source.gate_proj)
         self.up_proj = take(source.up_proj)
@@ -27,12 +30,12 @@ class TorchBlock:
         config = self.config
         normed = tb.rms_norm(x, self.attn_norm, config.norm_eps)
 
-        q = (normed @ self.q_proj).view(-1, config.num_heads, config.head_dim)
-        k = (normed @ self.k_proj).view(-1, config.num_kv_heads, config.head_dim)
-        v = (normed @ self.v_proj).view(-1, config.num_kv_heads, config.head_dim)
+        q = (normed @ self.q_proj + self.q_bias).view(-1, config.num_heads, config.head_dim)
+        k = (normed @ self.k_proj + self.k_bias).view(-1, config.num_kv_heads, config.head_dim)
+        v = (normed @ self.v_proj + self.v_bias).view(-1, config.num_kv_heads, config.head_dim)
 
-        q = tb.apply_rope(q, positions, cos, sin)
-        k = tb.apply_rope(k, positions, cos, sin)
+        q = tb.apply_rope(q, positions, cos, sin, config.rope_halved)
+        k = tb.apply_rope(k, positions, cos, sin, config.rope_halved)
 
         slots = torch.as_tensor(layout.slot_mapping, device=x.device, dtype=torch.long)
         tb.write_kv(k, v, k_cache, v_cache, slots)
