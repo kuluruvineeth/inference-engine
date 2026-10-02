@@ -3,7 +3,13 @@ import json
 import numpy as np
 import pytest
 
+from ie.core.block_manager import BlockManager
+from ie.core.layout import build_layout
+from ie.core.scheduler import Scheduler
+from ie.core.sequence import Sequence
 from ie.engine.engine import Engine, EngineConfig
+from ie.kernels.reference import allocate_kv_cache
+from ie.layers.functional import rope_tables
 from ie.load.huggingface import config_from_hf, layer_names, load_transformer, read_config
 from ie.load.safetensors import (
     SafetensorsFile,
@@ -22,7 +28,7 @@ HF_CONFIG = {
 }
 
 
-def synthetic_checkpoint(directory, config=None, tied=True, shards=1):
+def synthetic_checkpoint(directory, config=None, tied=True, shards=1, qk_norm=False):
     raw = dict(config or HF_CONFIG)
     raw["tie_word_embeddings"] = tied
     (directory / "config.json").write_text(json.dumps(raw))
@@ -49,6 +55,9 @@ def synthetic_checkpoint(directory, config=None, tied=True, shards=1):
         tensors[names["gate_proj"]] = normal(spec.intermediate_size, spec.hidden_size)
         tensors[names["up_proj"]] = normal(spec.intermediate_size, spec.hidden_size)
         tensors[names["down_proj"]] = normal(spec.hidden_size, spec.intermediate_size)
+        if qk_norm:
+            tensors[names["q_norm"]] = np.full(spec.head_dim, 30.0, dtype=np.float32) + normal(spec.head_dim)
+            tensors[names["k_norm"]] = np.full(spec.head_dim, 30.0, dtype=np.float32) + normal(spec.head_dim)
 
     if shards == 1:
         write_safetensors(directory / "model.safetensors", tensors)
@@ -126,6 +135,13 @@ def test_hf_config_maps_onto_our_config():
     assert spec.num_kv_heads == 2
     assert spec.rope_base == 1000000.0
     assert spec.norm_eps == 1e-5
+
+
+def test_rope_theta_is_read_from_rope_parameters():
+    raw = dict(HF_CONFIG)
+    del raw["rope_theta"]
+    raw["rope_parameters"] = {"rope_theta": 1000000.0, "rope_type": "default"}
+    assert config_from_hf(raw).rope_base == 1000000.0
 
 
 def test_head_dim_is_derived_when_absent():
@@ -229,3 +245,37 @@ def test_a_checkpoint_with_biases_loads_them(tmp_path):
     model, report = load_transformer(tmp_path)
     assert np.allclose(model.blocks[0].q_bias, bias)
     assert not report.unexpected
+
+
+def block_output(block):
+    scheduler = Scheduler(BlockManager(num_blocks=8, block_size=16), max_batch_tokens=64)
+    scheduler.add(Sequence(list(range(6)), block_size=16))
+    layout = build_layout(scheduler.schedule(), 16)
+    k_cache, v_cache = allocate_kv_cache(8, 16, block.config.num_kv_heads, block.config.head_dim)
+    x = np.random.default_rng(7).standard_normal((layout.num_tokens, block.config.hidden_size)).astype(np.float32)
+    cos, sin = rope_tables(64, block.config.head_dim, block.config.rope_base)
+    return block.forward(x, layout, k_cache, v_cache, cos, sin, 16)
+
+
+def test_qk_norm_weights_are_loaded(tmp_path):
+    tensors = synthetic_checkpoint(tmp_path, qk_norm=True)
+    model, report = load_transformer(tmp_path)
+    assert report.is_complete and not report.unexpected
+    assert np.allclose(model.blocks[1].k_norm, tensors[layer_names(1)["k_norm"]])
+
+
+def test_qk_norm_makes_attention_independent_of_query_and_key_scale(tmp_path):
+    synthetic_checkpoint(tmp_path, qk_norm=True)
+    block = load_transformer(tmp_path)[0].blocks[0]
+    before = block_output(block)
+    block.q_proj, block.k_proj = block.q_proj * 10, block.k_proj * 10
+    assert np.allclose(block_output(block), before, atol=1e-4)
+    block.q_norm = block.k_norm = None
+    assert not np.allclose(block_output(block), before, atol=1e-4)
+
+
+def test_checkpoints_without_qk_norm_skip_it(tmp_path):
+    synthetic_checkpoint(tmp_path)
+    model, report = load_transformer(tmp_path)
+    assert report.is_complete
+    assert all(block.q_norm is None and block.k_norm is None for block in model.blocks)

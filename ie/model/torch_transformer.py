@@ -21,6 +21,8 @@ class TorchBlock:
         self.q_bias = take(source.q_bias)
         self.k_bias = take(source.k_bias)
         self.v_bias = take(source.v_bias)
+        self.q_norm = None if source.q_norm is None else take(source.q_norm)
+        self.k_norm = None if source.k_norm is None else take(source.k_norm)
         self.mlp_norm = take(source.mlp_norm)
         self.gate_proj = take(source.gate_proj)
         self.up_proj = take(source.up_proj)
@@ -34,6 +36,9 @@ class TorchBlock:
         q = (normed @ self.q_proj + self.q_bias).view(-1, config.num_heads, config.head_dim)
         k = (normed @ self.k_proj + self.k_bias).view(-1, config.num_kv_heads, config.head_dim)
         v = (normed @ self.v_proj + self.v_bias).view(-1, config.num_kv_heads, config.head_dim)
+        if self.q_norm is not None:
+            q = tb.rms_norm(q, self.q_norm, config.norm_eps)
+            k = tb.rms_norm(k, self.k_norm, config.norm_eps)
 
         q = tb.apply_rope(q, positions, cos, sin, config.rope_halved)
         k = tb.apply_rope(k, positions, cos, sin, config.rope_halved)

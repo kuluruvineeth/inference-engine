@@ -40,7 +40,7 @@ def config_from_hf(raw: dict) -> ModelConfig:
         head_dim=head_dim,
         intermediate_size=raw["intermediate_size"],
         max_position=raw.get("max_position_embeddings", 4096),
-        rope_base=float(raw.get("rope_theta", 10000.0)),
+        rope_base=float(raw.get("rope_theta") or (raw.get("rope_parameters") or {}).get("rope_theta", 10000.0)),
         norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
         rope_halved=True,
     )
@@ -64,6 +64,8 @@ def layer_names(index: int) -> dict[str, str]:
         "q_bias": f"{prefix}.self_attn.q_proj.bias",
         "k_bias": f"{prefix}.self_attn.k_proj.bias",
         "v_bias": f"{prefix}.self_attn.v_proj.bias",
+        "q_norm": f"{prefix}.self_attn.q_norm.weight",
+        "k_norm": f"{prefix}.self_attn.k_norm.weight",
         "mlp_norm": f"{prefix}.post_attention_layernorm.weight",
         "gate_proj": f"{prefix}.mlp.gate_proj.weight",
         "up_proj": f"{prefix}.mlp.up_proj.weight",
@@ -72,7 +74,7 @@ def layer_names(index: int) -> dict[str, str]:
 
 
 TRANSPOSED = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
-OPTIONAL = {"q_bias", "k_bias", "v_bias"}
+OPTIONAL = {"q_bias", "k_bias", "v_bias", "q_norm", "k_norm"}
 
 
 def open_checkpoint(directory: str | Path):
